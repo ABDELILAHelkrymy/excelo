@@ -1,4 +1,9 @@
-pandas
 customtkinter
+fastexcel
 openpyxl
+pandas
+polars
+reportlab
 xlsxwriter
+arabic-reshaper
+python-bidi

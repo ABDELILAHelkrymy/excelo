@@ -20,6 +20,34 @@ from tkinter import BooleanVar, StringVar
 import pdf_generator
 import operations
 from export_utils import ensure_excel_output_path
+import subprocess
+
+def get_windows_printers():
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-Command", "Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return [p.strip() for p in out.splitlines() if p.strip()]
+    except Exception:
+        return []
+
+def get_default_printer():
+    try:
+        out = subprocess.check_output(
+            ["powershell", "-Command", "Get-CimInstance Win32_Printer | Where-Object Default -eq $true | Select-Object -ExpandProperty Name"],
+            text=True, creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        return out.strip()
+    except Exception:
+        return None
+
+def set_default_printer(printer_name):
+    try:
+        subprocess.run(["rundll32", "printui.dll,PrintUIEntry", "/y", "/n", printer_name], 
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    except Exception:
+        pass
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -981,13 +1009,82 @@ class App(ctk.CTk):
         ctk.CTkButton(opt_row, text="…", width=36,
                       command=self._sc_pick_dir).pack(side="left", padx=4)
 
+        # ── Output format & Auto-print ───────────────────────────────────────
+        fmt_row = ctk.CTkFrame(f, fg_color="transparent")
+        fmt_row.pack(fill="x", pady=(2, 2))
+        
+        self._sc_format_var = StringVar(value="Excel (.xlsx)")
+        ctk.CTkLabel(fmt_row, text="Format :").pack(side="left", padx=(0, 6))
+        ctk.CTkOptionMenu(fmt_row, variable=self._sc_format_var, 
+                          values=["Excel (.xlsx)", "PDF (.pdf)"], width=130).pack(side="left")
+        
+        self._sc_pdf_dir_var = StringVar(value="Arabe (RTL)")
+        self._sc_pdf_dir_menu = ctk.CTkOptionMenu(
+            fmt_row, variable=self._sc_pdf_dir_var, 
+            values=["Français (LTR)", "Arabe (RTL)"], width=130
+        )
+        
+        self._sc_autoprint_var = BooleanVar(value=False)
+        self._sc_autoprint_chk = ctk.CTkCheckBox(
+            fmt_row,
+            text="Imprimer automatiquement",
+            variable=self._sc_autoprint_var,
+        )
+        self._sc_autoprint_chk.pack(side="left", padx=14)
+        
+        self._sc_printer_var = StringVar(value="Par défaut")
+        self._sc_printer_menu = ctk.CTkOptionMenu(
+            fmt_row, variable=self._sc_printer_var, 
+            values=["Par défaut"], width=160
+        )
+        
+        def _open_props():
+            p = self._sc_printer_var.get()
+            if p and p != "Par défaut":
+                subprocess.Popen(["rundll32", "printui.dll,PrintUIEntry", "/e", "/n", p])
+                
+        self._sc_printer_props_btn = ctk.CTkButton(
+            fmt_row, text="Propriétés", width=80, 
+            fg_color="#89b4fa", text_color="#181825", hover_color="#74a1e9",
+            command=_open_props
+        )
+
+        # Load printers async
+        def _load_printers():
+            printers = get_windows_printers()
+            if printers:
+                self.after(0, lambda: self._sc_printer_menu.configure(values=["Par défaut"] + printers))
+        threading.Thread(target=_load_printers, daemon=True).start()
+        
+        def _on_sc_autoprint_changed(*args):
+            if self._sc_autoprint_var.get():
+                self._sc_printer_menu.pack(side="left", padx=(0, 6))
+                self._sc_printer_props_btn.pack(side="left")
+            else:
+                self._sc_printer_menu.pack_forget()
+                self._sc_printer_props_btn.pack_forget()
+        self._sc_autoprint_var.trace_add("write", _on_sc_autoprint_changed)
+        
+        def _on_sc_format_changed(*args):
+            if self._sc_format_var.get() == "PDF (.pdf)":
+                self._sc_pdf_dir_menu.pack(side="left", padx=(10, 0), before=self._sc_autoprint_chk)
+                self._sc_autoprint_chk.configure(state="normal")
+            else:
+                self._sc_pdf_dir_menu.pack_forget()
+                self._sc_autoprint_chk.configure(state="disabled")
+                self._sc_autoprint_var.set(False)
+                _on_sc_autoprint_changed()
+        self._sc_format_var.trace_add("write", _on_sc_format_changed)
+        _on_sc_format_changed()
+        _on_sc_autoprint_changed()
+
         # ── Zebra mode ───────────────────────────────────────────────────────
         zebra_row = ctk.CTkFrame(f, fg_color="transparent")
         zebra_row.pack(fill="x", pady=(2, 4))
         self._sc_zebra_var = BooleanVar(value=False)
         ctk.CTkCheckBox(
             zebra_row,
-            text="Mode zébré  (colorer les lignes en alternance dans les fichiers de sortie)",
+            text="Mode zébré  (colorer les lignes en alternance dans les fichiers Excel)",
             variable=self._sc_zebra_var,
         ).pack(side="left")
 
@@ -2032,6 +2129,9 @@ class App(ctk.CTk):
         self._sc_split_list.delete(*self._sc_split_list.get_children())
         self._sc_rebuild_cols()
         self._sc_dir_var.set("")
+        self._sc_format_var.set("Excel (.xlsx)")
+        self._sc_autoprint_var.set(False)
+        self._sc_printer_var.set("Par défaut")
         # Reset PDF Reporting
         self._pdf_files.clear()
         self._pdf_multi_refresh_tree()
@@ -2366,6 +2466,11 @@ class App(ctk.CTk):
         out_dir = base_dir / ts
 
         zebra = self._sc_zebra_var.get()
+        out_format = self._sc_format_var.get()
+        pdf_dir = self._sc_pdf_dir_var.get()
+        auto_print = self._sc_autoprint_var.get()
+        selected_printer = getattr(self, "_sc_printer_var", None)
+        target_printer = selected_printer.get() if selected_printer else "Par défaut"
         split_cols = list(self._sc_split_cols)
         all_sheets_mode = (
             getattr(self, "_sc_all_sheets_var", None) is not None
@@ -2487,8 +2592,72 @@ class App(ctk.CTk):
                 ))
             return counter
 
+        # ── 5c. PDF split: write with ReportLab ──
+        def _process_pdf(df_sheet, dest_dir, counter):
+            keep_present = [c for c in keep_cols if c in df_sheet.columns]
+            cols_present = [c for c in split_cols if c in df_sheet.columns]
+            if not keep_present or not cols_present:
+                return counter
+
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            groups = df_sheet.partition_by(cols_present, maintain_order=True, as_dict=True)
+            
+            orig_printer = None
+            if auto_print and target_printer != "Par défaut":
+                orig_printer = get_default_printer()
+                if target_printer != orig_printer:
+                    set_default_printer(target_printer)
+
+            for keys, group_df in groups.items():
+                if self._cancel_requested:
+                    break
+                if isinstance(keys, str):
+                    keys = (keys,)
+                fname = _safe_fname(keys)
+                out_path = dest_dir / f"{fname}.pdf"
+                
+                title = " - ".join(str(k) for k in keys) if keys else "Rapport"
+                sub = group_df.select(keep_present)
+                
+                try:
+                    pdf_generator.generate_report(
+                        df=sub,
+                        output_path=str(out_path),
+                        title=title,
+                        subtitle="Extrait généré par Split (Colonnes)",
+                        orientation="Paysage",
+                        direction=pdf_dir
+                    )
+                    
+                    if auto_print:
+                        import os
+                        try:
+                            os.startfile(str(out_path), "print")
+                            import time
+                            time.sleep(1.5)  # give Windows spooler a moment to queue
+                        except Exception as e:
+                            logging.error(f"Échec de l'impression de {out_path}: {e}")
+                except Exception as e:
+                    logging.exception(f"Erreur PDF pour {fname}")
+                    
+                counter += 1
+                done = counter
+                self.after(0, lambda d=done: (
+                    self._sc_prog_bar.set(d / total_groups),
+                    self._sc_prog_label.configure(
+                        text=f"{d} / {total_groups} fichier(s) créé(s)")
+                ))
+                
+            if auto_print and orig_printer and target_printer != "Par défaut":
+                set_default_printer(orig_printer)
+                
+            return counter
+
         # Select the appropriate processing function
-        _process = _process_zebra if zebra else _process_fast
+        if out_format == "PDF (.pdf)":
+            _process = _process_pdf
+        else:
+            _process = _process_zebra if zebra else _process_fast
 
         # ── 6. Background worker ────────────────────────────────────────
         def _worker():

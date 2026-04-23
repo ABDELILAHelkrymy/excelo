@@ -19,35 +19,13 @@ import fastexcel
 from tkinter import BooleanVar, StringVar
 import pdf_generator
 import operations
-from export_utils import ensure_excel_output_path
-import subprocess
-
-def get_windows_printers():
-    try:
-        out = subprocess.check_output(
-            ["powershell", "-Command", "Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        return [p.strip() for p in out.splitlines() if p.strip()]
-    except Exception:
-        return []
-
-def get_default_printer():
-    try:
-        out = subprocess.check_output(
-            ["powershell", "-Command", "Get-CimInstance Win32_Printer | Where-Object Default -eq $true | Select-Object -ExpandProperty Name"],
-            text=True, creationflags=subprocess.CREATE_NO_WINDOW
-        )
-        return out.strip()
-    except Exception:
-        return None
-
-def set_default_printer(printer_name):
-    try:
-        subprocess.run(["rundll32", "printui.dll,PrintUIEntry", "/y", "/n", printer_name], 
-                       creationflags=subprocess.CREATE_NO_WINDOW)
-    except Exception:
-        pass
+from core.printer_service import get_windows_printers, get_default_printer, set_default_printer
+from core.ui_utils import load_file, fmt, show_done_dialog
+from export_utils import ensure_excel_output_path, apply_zebra
+from ui.file_panel import FilePanel
+import core.pdf_batch_service as pdf_batch
+import core.polars_split_service as split_service
+import core.pdf_to_excel_service as pdf_to_excel
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -63,7 +41,7 @@ DEFAULT_OUT   = pathlib.Path.home() / "Desktop" / "Résultats"
 OPERATIONS    = [
     "Soustraire  (A − B)", "Fusionner  (A ∪ B)", "Intersecter  (A ∩ B)", 
     "Enrichir  (A ← B)", "Combiner  (Multi-fichiers)", "Extraire  (Filtrer A)", 
-    "Split  (Sheets)", "Split  (Columns)", "Excel to PDF"
+    "Split  (Sheets)", "Split  (Columns)", "Split  (Lines)", "Excel to PDF", "PDF to Excel"
 ]
 CONDITIONS    = [
     "égal à", "différent de", "contient",
@@ -80,242 +58,14 @@ OP_DESC = {
     "Extraire  (Filtrer A)": "Filtre les lignes de A selon une condition sur une colonne choisie.",
     "Split  (Sheets)":    "Sépare chaque onglet d'un ou plusieurs fichiers Excel en fichiers individuels.",
     "Split  (Columns)":   "Charge un seul fichier, choisissez les colonnes à conserver et une ou plusieurs colonnes de découpe. Génère un fichier Excel par combinaison de valeurs unique.",
+    "Split  (Lines)":     "Charge un seul fichier et le découpe en plusieurs fichiers d'un nombre de lignes fixe.",
     "Excel to PDF": "Génère des rapports PDF stylisés (en masse) à partir d'un dossier de fichiers Excel.",
+    "PDF to Excel": "Extrait tous les tableaux contenus dans un ou plusieurs fichiers PDF pour les transformer en fichiers Excel."
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def load_file(path: str) -> pl.DataFrame:
-    p = pathlib.Path(path)
-    if p.suffix.lower() in (".xlsx", ".xls"):
-        return operations.cleanup_floats(pl.read_excel(path))
-    raise ValueError(f"Unsupported file type: {p.suffix}")
-
-
-def fmt(n) -> str:
-    """Format a row-count or return '—' for None."""
-    return f"{n:,}" if isinstance(n, int) else "—"
-
-
-def _show_done_dialog(parent, title: str, message: str, open_path: str):
-    """Show a completion dialog with 'Ouvrir' and 'Fermer' buttons."""
-    w, h = 460, 150
-    dlg = ctk.CTkToplevel(parent)
-    dlg.title("Opération Terminée")
-    # Center on screen
-    sx = dlg.winfo_screenwidth()
-    sy = dlg.winfo_screenheight()
-    dlg.geometry(f"{w}x{h}+{(sx - w) // 2}+{(sy - h) // 2}")
-    dlg.resizable(False, False)
-    dlg.grab_set()
-    dlg.transient(parent)
-    ctk.CTkLabel(dlg, text=message, wraplength=420,
-                 font=ctk.CTkFont(size=12)).pack(padx=20, pady=(20, 14))
-    btn_row = ctk.CTkFrame(dlg, fg_color="transparent")
-    btn_row.pack(pady=(0, 16))
-    def _open():
-        p = pathlib.Path(open_path)
-        target = p if p.is_dir() else p.parent
-        try:
-            os.startfile(str(target))
-        except AttributeError:
-            # Fallback for non-Windows platforms
-            pass
-        dlg.destroy()
-    ctk.CTkButton(btn_row, text="📂  Ouvrir le dossier", width=160,
-                  command=_open).pack(side="left", padx=(0, 10))
-    ctk.CTkButton(btn_row, text="Fermer", width=100,
-                  fg_color="gray40", hover_color="gray30",
-                  command=dlg.destroy).pack(side="left")
-
-
-def _apply_zebra(path: str):
-    """Apply zebra striping (alternating row colors + styled header) to an xlsx file."""
-    import os
-    import logging
-    try:
-        from openpyxl import load_workbook
-        from openpyxl.styles import PatternFill, Font
-        wb = load_workbook(path)
-        fill_hdr  = PatternFill(fill_type="solid", fgColor="4472C4")
-        fill_even = PatternFill(fill_type="solid", fgColor="DCE6F1")
-        fill_odd  = PatternFill(fill_type="solid", fgColor="FFFFFF")
-        font_hdr  = Font(bold=True, color="FFFFFF")
-        for ws in wb.worksheets:
-            ncols = ws.max_column or 1
-            nrows = ws.max_row or 1
-            for c in range(1, ncols + 1):
-                cell = ws.cell(1, c)
-                cell.fill = fill_hdr
-                cell.font = font_hdr
-            for r in range(2, nrows + 1):
-                rf = fill_even if (r % 2 == 0) else fill_odd
-                for c in range(1, ncols + 1):
-                    ws.cell(r, c).fill = rf
-        tmp_path = path + ".tmp"
-        wb.save(tmp_path)
-        os.replace(tmp_path, path)
-    except Exception as e:
-        logging.exception(f"Erreur lors de l'application du style zébré sur {path}")
-
-
-# ── FilePanel ─────────────────────────────────────────────────────────────────
-
-class FilePanel(ctk.CTkFrame):
-    """Browse button + key-column dropdown + 5-row preview table."""
-
-    def __init__(self, master, label: str, on_load=None, **kwargs):
-        super().__init__(master, **kwargs)
-        self.label    = label
-        self.on_load  = on_load
-        self.df: pl.DataFrame | None = None
-        self.path: str = ""
-        self._build()
-
-    def _build(self):
-        # ── Header ──────────────────────────────────────────────────────────
-        hdr = ctk.CTkFrame(self, fg_color="transparent")
-        hdr.pack(fill="x", padx=8, pady=(8, 2))
-        ctk.CTkLabel(hdr, text=self.label, text_color="#cdd6f4",
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(side="left")
-        ctk.CTkButton(hdr, text="Parcourir …", width=110,
-                      fg_color="#89b4fa", text_color="#181825", hover_color="#74a1e9",
-                      command=self._browse).pack(side="right")
-
-        self._fname_var = StringVar(value="Aucun fichier sélectionné")
-        self._fname_lbl = ctk.CTkLabel(self, textvariable=self._fname_var,
-                     text_color="#a6adc8",
-                     font=ctk.CTkFont(size=11))
-        self._fname_lbl.pack(anchor="w", padx=10, pady=(0, 2))
-
-        # ── Sheet selector (shown only for multi-sheet Excel) ────────────────
-        self._sheet_row = ctk.CTkFrame(self, fg_color="transparent")
-        self._sheet_row.pack(fill="x", padx=8, pady=(0, 2))
-        ctk.CTkLabel(self._sheet_row, text="Onglet :").pack(side="left", padx=(0, 6))
-        self.sheet_var = StringVar(value="—")
-        self.sheet_menu = ctk.CTkOptionMenu(
-            self._sheet_row, variable=self.sheet_var,
-            values=["—"], width=200, command=self._on_sheet_change)
-        self.sheet_menu.pack(side="left", fill="x", expand=True)
-        self._sheet_row.pack_forget()          # hidden until multi-sheet file loaded
-        self._xls = None
-
-        # ── Key column dropdown ──────────────────────────────────────────────
-        row = ctk.CTkFrame(self, fg_color="transparent")
-        row.pack(fill="x", padx=8, pady=(0, 2))
-        ctk.CTkLabel(row, text="Colonne clé :").pack(side="left", padx=(0, 6))
-        self.col_var  = StringVar(value="— charger un fichier —")
-        self.col_menu = ctk.CTkOptionMenu(row, variable=self.col_var,
-                                          values=["— charger un fichier —"],
-                                          width=200)
-        self.col_menu.pack(side="left", fill="x", expand=True)
-
-        self._info_var = StringVar(value="")
-        ctk.CTkLabel(self, textvariable=self._info_var,
-                     text_color="#a6adc8",
-                     font=ctk.CTkFont(size=11)).pack(anchor="w", padx=10)
-
-        # ── Preview table ────────────────────────────────────────────────────
-        pf = ctk.CTkFrame(self, fg_color="transparent")
-        pf.pack(fill="both", expand=True, padx=8, pady=(4, 8))
-        pf.columnconfigure(0, weight=1)
-        pf.rowconfigure(0, weight=1)
-
-        self._tree = ttk.Treeview(pf, height=4, show="headings")
-        vsb = ttk.Scrollbar(pf, orient="vertical",   command=self._tree.yview)
-        hsb = ttk.Scrollbar(pf, orient="horizontal",  command=self._tree.xview)
-        self._tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self._tree.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-
-    # ── Public ───────────────────────────────────────────────────────────────
-
-    def get_column(self) -> str:
-        return self.col_var.get()
-
-    # ── Internal ─────────────────────────────────────────────────────────────
-
-    def _browse(self):
-        path = filedialog.askopenfilename(
-            title=f"Sélectionner {self.label}",
-            filetypes=[("Excel", "*.xlsx *.xls"), ("Tous les fichiers", "*.*")],
-        )
-        if not path:
-            return
-        self._fname_var.set("Chargement en cours …")
-        self._info_var.set("")
-
-        def _load_in_thread():
-            p = pathlib.Path(path)
-            xls_sheets = []
-            try:
-                if p.suffix.lower() in (".xlsx", ".xls"):
-                    import fastexcel
-                    xls_obj = fastexcel.read_excel(path)
-                    xls_sheets = xls_obj.sheet_names
-                    # Load first sheet
-                    df = operations.cleanup_floats(xls_obj.load_sheet(xls_sheets[0]).to_polars())
-                else:
-                    df = load_file(path)
-            except Exception as e:
-                self.after(0, lambda: messagebox.showerror("Erreur de chargement", str(e)))
-                self.after(0, lambda: self._fname_var.set("Aucun fichier sélectionné"))
-                return
-
-            def _apply():
-                self._xls = None
-                self._sheet_row.pack_forget()
-                if len(xls_sheets) > 1:
-                    self._xls = path
-                    self.sheet_menu.configure(values=xls_sheets)
-                    self.sheet_var.set(xls_sheets[0])
-                    self._sheet_row.pack(fill="x", padx=8, pady=(0, 2),
-                                          after=self._fname_lbl)
-                self._accept(path, df)
-            self.after(0, _apply)
-
-        threading.Thread(target=_load_in_thread, daemon=True).start()
-
-    def _accept(self, path: str, df: pl.DataFrame):
-        self.path = path
-        self.df   = df
-        self._fname_var.set(pathlib.Path(path).name)
-        self._info_var.set(f"{len(df):,} lignes · {len(df.columns)} colonnes")
-        cols = list(df.columns)
-        self.col_menu.configure(values=cols)
-        self.col_var.set(cols[0])
-        self._populate_preview(df)
-        if self.on_load:
-            self.on_load()
-
-    def _on_sheet_change(self, sheet_name: str):
-        """Re-parse the selected sheet and update preview / columns."""
-        if self._xls is None:
-            return
-        try:
-            df = pl.read_excel(self._xls, sheet_name=sheet_name)
-        except Exception as e:
-            messagebox.showerror("Erreur", str(e))
-            return
-        self.df = df
-        self._info_var.set(f"{len(df):,} lignes · {len(df.columns)} colonnes")
-        cols = list(df.columns)
-        self.col_menu.configure(values=cols)
-        self.col_var.set(cols[0])
-        self._populate_preview(df)
-        if self.on_load:
-            self.on_load()
-
-    def _populate_preview(self, df: pl.DataFrame):
-        self._tree.delete(*self._tree.get_children())
-        self._tree["columns"] = list(df.columns)
-        for c in df.columns:
-            self._tree.heading(c, text=c)
-            self._tree.column(c, width=100, minwidth=50, stretch=False)
-        for row in df.head(5).rows():
-            self._tree.insert("", "end", values=row)
-
+# Extracted helpers and components have been moved to core/ui_utils.py and ui/file_panel.py
 
 # ── Main Application ──────────────────────────────────────────────────────────
 
@@ -392,9 +142,9 @@ class App(ctk.CTk):
 
         self._op_var = StringVar(value=OPERATIONS[0])
 
-        # Split into two rows so all 9 operations are always visible
-        ROW1 = OPERATIONS[:5]   # Soustraire, Fusionner, Intersecter, Enrichir, Combiner
-        ROW2 = OPERATIONS[5:]   # Extraire, Split (Sheets), Split (Columns), Excel to PDF
+        # Split into two rows so all operations are visible
+        ROW1 = OPERATIONS[:6]   # Soustraire, Fusionner, Intersecter, Enrichir, Combiner, Extraire
+        ROW2 = OPERATIONS[6:]   # Split (Sheets), Split (Columns), Split (Lines), Excel to PDF, PDF to Excel
 
         def _on_row1(val):
             self._op_var.set(val)
@@ -475,7 +225,9 @@ class App(ctk.CTk):
             "extract":  self._build_extract_panel(host),
             "split":    self._build_split_panel(host),
             "splitcol": self._build_splitcol_panel(host),
+            "splitline":self._build_splitline_panel(host),
             "pdf":      self._build_pdf_panel(host),
+            "pdf2xl":   self._build_pdf_to_excel_panel(host),
         }
         self._show_sub("mi")
 
@@ -1428,110 +1180,71 @@ class App(ctk.CTk):
                 self._set_running(False)
                 return
 
-        # Build list of (file_path, sheet_name)
-        work_list = []
-        for path in files_to_process:
-            try:
-                xls = fastexcel.read_excel(path)
-                for s in xls.sheet_names:
-                    work_list.append((path, s))
-            except Exception:
-                continue
+        self._pdf_prog_frame.pack(fill="x", padx=4, pady=(2, 4))
+        
+        pdf_batch.run_pdf_report_batch(
+            files_to_process=files_to_process,
+            title=title,
+            subtitle=subtitle,
+            orient=orient,
+            direc=direc,
+            progress_bar=self._pdf_prog_bar,
+            progress_label=self._pdf_prog_label,
+            stats_var=self._stats_var,
+            log_func=self._log,
+            show_done_func=lambda t, m, p: show_done_dialog(self, t, m, p),
+            set_running_func=self._set_running,
+            cancel_check_func=lambda: self._cancel_requested,
+            after_func=self.after
+        )
 
-        total_sheets = len(work_list)
-        if total_sheets == 0:
-            messagebox.showwarning("Aucun onglet", "Aucun onglet Excel n'a été trouvé dans les fichiers sélectionnés.")
+    def _op_pdf_to_excel(self):
+        """Extract tables from PDF files to Excel."""
+        if not self._pdf2xl_selected:
+            messagebox.showwarning("Aucun fichier", "Sélectionnez au moins un fichier PDF dans la liste.")
             self._set_running(False)
             return
 
-        # Show progress bar
-        self._pdf_prog_frame.pack(fill="x", padx=4, pady=(2, 4))
-        self._pdf_prog_bar.set(0)
-        self._pdf_prog_label.configure(text=f"Préparation : 0 / {total_sheets} onglets ...")
-        self.update_idletasks()
+        merge_tables = self._pdf2xl_merge_var.get()
+        out_dir_str = self._pdf2xl_dir_var.get().strip()
 
-        def _worker():
-            done_sheets = 0   # total processed (including skipped)
-            created = 0        # actually generated PDFs (ISSUE-026)
-            errors = []
-            last_dest_dir = None  # track the folder of the last successfully created PDF
+        files_to_process = [self._pdf2xl_files[name] for name in sorted(self._pdf2xl_selected)]
 
-            for path, sname in work_list:
-                if self._cancel_requested:
-                    self.after(0, lambda: self._log("Génération PDF annulée par l'utilisateur."))
-                    break
-
-                try:
-                    p = pathlib.Path(path)
-                    # Load exact sheet
-                    xls = fastexcel.read_excel(path)
-                    df = operations.cleanup_floats(xls.load_sheet(sname).to_polars())
-
-                    if df.is_empty():
-                        done_sheets += 1
-                        continue
-
-                    # Generate name: {file}_{sheet}.pdf — saved next to the source Excel
-                    safe_sname = "".join([c if c.isalnum() else "_" for c in sname])
-                    out_name = f"{p.stem}_{safe_sname}.pdf"
-                    dest = p.parent / out_name
-
-                    # FIX ISSUE-002: capture loop vars by value using default args
-                    def _row_progress(current, total,
-                                      _done=done_sheets, _p=p, _sname=sname):
-                        # F-11: Clamp to 0.99 — final 1.0 is set only in _final()
-                        pct = min(
-                            (_done / total_sheets) + (current / total / total_sheets),
-                            0.99
-                        )
-                        self.after(0, lambda: (
-                            self._pdf_prog_bar.set(pct),
-                            self._pdf_prog_label.configure(
-                                text=f"File: {_p.name} | Sheet: {_sname} | Rows: {current}/{total}")
-                        ))
-
-                    pdf_generator.generate_report(
-                        df=df,
-                        output_path=str(dest),
-                        title=title,
-                        subtitle=subtitle,
-                        orientation=orient,
-                        direction=direc,
-                        progress_callback=_row_progress
-                    )
-                    created += 1
-                    last_dest_dir = str(p.parent)
-                except Exception as e:
-                    errors.append(f"{pathlib.Path(path).name} [{sname}]: {e}")
-                    logging.exception("Erreur génération PDF")
-
-                done_sheets += 1
-                self.after(0, lambda d=done_sheets: (
-                    self._pdf_prog_bar.set(d / total_sheets),
-                    self._pdf_prog_label.configure(text=f"Terminé : {d} / {total_sheets} onglets")
-                ))
-
-            def _final():
-                self._pdf_prog_bar.set(1)
-                if errors:
-                    msg = "\n".join(errors[:5]) + ("\n..." if len(errors) > 5 else "")
-                    messagebox.showwarning("Terminé avec erreurs", f"Certains rapports ont échoué :\n{msg}")
-
-                # ISSUE-026: use 'created', not 'done_sheets', for accurate count
-                status_txt = "annulée" if self._cancel_requested else "terminée"
-                summary = f"Génération {status_txt}. {created} rapport(s) créé(s) dans le(s) dossier(s) source(s)."
-                self._pdf_prog_label.configure(text=f"✓ {summary}")
-                self._stats_var.set(summary)
-                self._log(f"[Excel to PDF] {summary}")
-                
-                if not self._cancel_requested and last_dest_dir:
-                    _show_done_dialog(self, "Export PDF terminé", summary, last_dest_dir)
-                
+        missing = [p for p in files_to_process if not pathlib.Path(p).exists()]
+        if missing:
+            missing_names = "\n".join(pathlib.Path(p).name for p in missing[:10])
+            suffix = f"\n… et {len(missing) - 10} autre(s)" if len(missing) > 10 else ""
+            proceed = messagebox.askyesno(
+                "Fichiers introuvables",
+                f"Les fichiers suivants sont introuvables sur le disque :\n\n"
+                f"{missing_names}{suffix}\n\n"
+                f"Continuer avec les fichiers restants ?"
+            )
+            if not proceed:
                 self._set_running(False)
+                return
+            files_to_process = [p for p in files_to_process if pathlib.Path(p).exists()]
+            if not files_to_process:
+                messagebox.showwarning("Aucun fichier valide", "Aucun fichier sélectionné n'existe sur le disque.")
+                self._set_running(False)
+                return
 
-            self.after(0, _final)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        self._pdf2xl_prog_frame.pack(fill="x", padx=4, pady=(2, 4))
+        
+        pdf_to_excel.run_pdf_to_excel_batch(
+            files_to_process=files_to_process,
+            out_dir_str=out_dir_str,
+            merge_tables=merge_tables,
+            progress_bar=self._pdf2xl_prog_bar,
+            progress_label=self._pdf2xl_prog_label,
+            stats_var=self._stats_var,
+            log_func=self._log,
+            show_done_func=lambda t, m, p: show_done_dialog(self, t, m, p),
+            set_running_func=self._set_running,
+            cancel_check_func=lambda: self._cancel_requested,
+            after_func=self.after,
+            default_out_path=DEFAULT_OUT
+        )
 
     # ── Split helpers ─────────────────────────────────────────────────────────
 
@@ -1725,6 +1438,133 @@ class App(ctk.CTk):
 
         return f
 
+    def _build_splitline_panel(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+
+        # ── Configuration ───────────────────────────────────────────────
+        row = ctk.CTkFrame(f, fg_color="transparent")
+        row.pack(fill="x", pady=4)
+        ctk.CTkLabel(row, text="Nombre de lignes par fichier :").pack(side="left", padx=(0, 6))
+        self._sl_lines_var = StringVar(value="1000")
+        ctk.CTkEntry(row, textvariable=self._sl_lines_var, width=100).pack(side="left")
+
+        # ── Output folder ────────────────────────────────────────────────
+        out_row = ctk.CTkFrame(f, fg_color="transparent")
+        out_row.pack(fill="x", pady=4)
+        ctk.CTkLabel(out_row, text="Dossier de sortie :").pack(side="left", padx=(0, 6))
+        self._sl_dir_var = StringVar(value=str(DEFAULT_OUT))
+        ctk.CTkEntry(out_row, textvariable=self._sl_dir_var, width=320).pack(side="left")
+        
+        def _pick_dir():
+            d = filedialog.askdirectory(title="Dossier de sortie")
+            if d:
+                self._sl_dir_var.set(d)
+                
+        ctk.CTkButton(out_row, text="Parcourir", width=80, command=_pick_dir).pack(side="left", padx=4)
+
+        # ── Zebra option ─────────────────────────────────────────────────
+        self._sl_zebra_var = BooleanVar(value=False)
+        ctk.CTkCheckBox(f, text="Mode zébré (colorer les lignes en alternance)",
+                        variable=self._sl_zebra_var).pack(anchor="w", pady=(8, 4))
+
+        # ── Progress ─────────────────────────────────────────────────────
+        self._sl_prog_frame = ctk.CTkFrame(f, fg_color="transparent")
+        # packed dynamically when running
+        self._sl_prog_bar = ctk.CTkProgressBar(self._sl_prog_frame, height=12)
+        self._sl_prog_bar.pack(fill="x", pady=(4, 2))
+        self._sl_prog_bar.set(0)
+        self._sl_prog_label = ctk.CTkLabel(self._sl_prog_frame, text="", font=ctk.CTkFont(size=11))
+        self._sl_prog_label.pack(anchor="w")
+
+        return f
+
+    def _build_pdf_to_excel_panel(self, parent) -> ctk.CTkFrame:
+        f = ctk.CTkFrame(parent, fg_color="transparent")
+
+        # ── File selection ───────────────────────────────────────────────
+        btn_row = ctk.CTkFrame(f, fg_color="transparent")
+        btn_row.pack(fill="x", pady=(4, 4))
+        
+        def _add_pdfs():
+            paths = filedialog.askopenfilenames(
+                title="Ajouter des PDF", filetypes=[("Fichiers PDF", "*.pdf")]
+            )
+            for p in paths:
+                name = pathlib.Path(p).name
+                self._pdf2xl_files[name] = p
+                self._pdf2xl_selected.add(name)
+            self._pdf2xl_list_var.set(list(self._pdf2xl_files.keys()))
+
+        def _remove_pdfs():
+            for name in list(self._pdf2xl_selected):
+                if name in self._pdf2xl_files:
+                    del self._pdf2xl_files[name]
+            self._pdf2xl_selected.clear()
+            self._pdf2xl_list_var.set(list(self._pdf2xl_files.keys()))
+
+        ctk.CTkButton(btn_row, text="Ajouter des PDF …", width=170,
+                      fg_color="#89b4fa", text_color="#181825", hover_color="#74a1e9",
+                      command=_add_pdfs).pack(side="left")
+        ctk.CTkButton(btn_row, text="Retirer sélection", width=130,
+                      fg_color="#f38ba8", text_color="#181825", hover_color="#d97d97",
+                      command=_remove_pdfs).pack(side="left", padx=8)
+
+        # Internal state
+        self._pdf2xl_files: dict[str, str] = {}
+        self._pdf2xl_selected = set()
+
+        list_fr = ctk.CTkFrame(f)
+        list_fr.pack(fill="both", expand=True, pady=(0, 4))
+        self._pdf2xl_list_var = ctk.Variable(value=[])
+        
+        # We use a standard tkinter Listbox since ctk doesn't have a multi-select listbox yet
+        import tkinter as tk
+        lb = tk.Listbox(list_fr, listvariable=self._pdf2xl_list_var,
+                        selectmode="extended", height=6, bg="#1e1e2e", fg="#cdd6f4",
+                        selectbackground="#89b4fa", selectforeground="#1e1e2e",
+                        borderwidth=0, highlightthickness=0)
+        lb.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_fr, orient="vertical", command=lb.yview)
+        sb.pack(side="right", fill="y")
+        lb.configure(yscrollcommand=sb.set)
+        
+        def _on_select(event):
+            idxs = lb.curselection()
+            self._pdf2xl_selected = {lb.get(i) for i in idxs}
+        lb.bind("<<ListboxSelect>>", _on_select)
+
+        # ── Options ────────────────────────────────────────────────────────
+        opt_row = ctk.CTkFrame(f, fg_color="transparent")
+        opt_row.pack(fill="x", pady=4)
+        
+        self._pdf2xl_merge_var = BooleanVar(value=True)
+        ctk.CTkCheckBox(opt_row, text="Fusionner tous les tableaux dans un seul onglet Excel",
+                        variable=self._pdf2xl_merge_var).pack(side="left")
+
+        # ── Output Directory ─────────────────────────────────────────────
+        out_row = ctk.CTkFrame(f, fg_color="transparent")
+        out_row.pack(fill="x", pady=(8, 4))
+        ctk.CTkLabel(out_row, text="Dossier de sortie :").pack(side="left", padx=(0, 6))
+        self._pdf2xl_dir_var = StringVar(value=str(DEFAULT_OUT))
+        ctk.CTkEntry(out_row, textvariable=self._pdf2xl_dir_var, width=320).pack(side="left")
+        
+        def _pick_dir():
+            d = filedialog.askdirectory(title="Dossier de destination")
+            if d:
+                self._pdf2xl_dir_var.set(d)
+                
+        ctk.CTkButton(out_row, text="Parcourir", width=80, command=_pick_dir).pack(side="left", padx=4)
+
+        # ── Progress ─────────────────────────────────────────────────────
+        self._pdf2xl_prog_frame = ctk.CTkFrame(f, fg_color="transparent")
+        self._pdf2xl_prog_bar = ctk.CTkProgressBar(self._pdf2xl_prog_frame, height=12)
+        self._pdf2xl_prog_bar.pack(fill="x", pady=(4, 2))
+        self._pdf2xl_prog_bar.set(0)
+        self._pdf2xl_prog_label = ctk.CTkLabel(self._pdf2xl_prog_frame, text="", font=ctk.CTkFont(size=11))
+        self._pdf2xl_prog_label.pack(anchor="w")
+
+        return f
+
     def _build_result_section(self):
         sec = ctk.CTkFrame(self._scroll, fg_color="#313244", corner_radius=10, border_width=1, border_color="#45475a")
         sec.pack(fill="both", expand=True, padx=4, pady=6)
@@ -1875,8 +1715,12 @@ class App(ctk.CTk):
             key = "split"
         elif val == "Split  (Columns)":
             key = "splitcol"
+        elif val == "Split  (Lines)":
+            key = "splitline"
         elif val == "Excel to PDF":
             key = "pdf"
+        elif val == "PDF to Excel":
+            key = "pdf2xl"
         else:
             key = "mi"
         self._show_sub(key)
@@ -1887,8 +1731,8 @@ class App(ctk.CTk):
             self._mi_col_frame.grid_remove()
         # Hide file panels and result section for standalone operations
         is_standalone = val in ("Split  (Sheets)", "Combiner  (Multi-fichiers)",
-                                "Split  (Columns)", "Excel to PDF")
-        is_scinder = val in ("Split  (Sheets)", "Split  (Columns)", "Excel to PDF")
+                                "Split  (Columns)", "Split  (Lines)", "Excel to PDF", "PDF to Excel")
+        is_scinder = val in ("Split  (Sheets)", "Split  (Columns)", "Split  (Lines)", "Excel to PDF", "PDF to Excel")
         if is_standalone:
             self._files_sec.pack_forget()
         else:
@@ -2196,11 +2040,17 @@ class App(ctk.CTk):
         if op == "Split  (Columns)":
             self._op_splitcol()
             return
+        if op == "Split  (Lines)":
+            self._op_splitline()
+            return
         if op == "Split  (Sheets)":
             self._op_split()
             return
         if op == "Excel to PDF":
             self._op_pdf_report()
+            return
+        if op == "PDF to Excel":
+            self._op_pdf_to_excel()
             return
 
         # ── Snapshot all shared data on the main thread before dispatching ──
@@ -2355,86 +2205,74 @@ class App(ctk.CTk):
             self._set_running(False)
             return
 
-        # Snapshot all state on main thread
         pattern = self._sp_name_var.get().strip() or "{fichier}_{onglet}"
         out_dir_str = self._sp_dir_var.get().strip()
-        base_dir = pathlib.Path(out_dir_str) if out_dir_str else DEFAULT_OUT
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        dest_dir = base_dir / ts
-        total_sheets = len(selected_sheets)
-        sp_files_copy = dict(self._sp_files)
         zebra = self._sp_zebra_var.get()
 
-        # Show progress bar
         self._sp_prog_frame.pack(fill="x", padx=4, pady=(2, 4))
-        self._sp_prog_bar.set(0)
-        self._sp_prog_label.configure(text=f"0 / {total_sheets} onglet(s) — démarrage …")
-        self.update_idletasks()
+        
+        split_service.run_split_sheets(
+            sp_files=dict(self._sp_files),
+            selected_sheets=selected_sheets,
+            pattern=pattern,
+            out_dir_str=out_dir_str,
+            zebra=zebra,
+            progress_bar=self._sp_prog_bar,
+            progress_label=self._sp_prog_label,
+            stats_var=self._stats_var,
+            log_func=self._log,
+            show_done_func=lambda t, m, p: show_done_dialog(self, t, m, p),
+            set_running_func=self._set_running,
+            cancel_check_func=lambda: self._cancel_requested,
+            after_func=self.after,
+            default_out_path=DEFAULT_OUT
+        )
 
-        def _worker():
-            total_written = 0
-            error_msg = None
-            try:
-                dest_dir.mkdir(parents=True, exist_ok=True)
-                for path, sheets in sp_files_copy.items():
-                    if self._cancel_requested:
-                        break
-                    src = pathlib.Path(path)
-                    try:
-                        xls = fastexcel.read_excel(path)
-                    except Exception:
-                        continue
-                    for sname in xls.sheet_names:
-                        if self._cancel_requested:
-                            break
-                        if (path, sname) not in selected_sheets:
-                            continue
-                        df = operations.cleanup_floats(xls.load_sheet(sname).to_polars())
-                        fname = pattern.format(fichier=src.stem, onglet=sname)
-                        fname = fname.replace("/", "_").replace("\\", "_")
-                        out_path = dest_dir / f"{fname}.xlsx"
-                        df.write_excel(out_path)
-                        if zebra:
-                            _apply_zebra(str(out_path))
-                        total_written += 1
-                        done = total_written
-                        self.after(0, lambda d=done: (
-                            self._sp_prog_bar.set(d / total_sheets),
-                            self._sp_prog_label.configure(
-                                text=f"{d} / {total_sheets} onglet(s) traité(s)")
-                        ))
-            except Exception as e:
-                error_msg = str(e)
-                logging.exception("Erreur _op_split")
+    def _op_splitline(self):
+        """Split a file by a fixed number of rows per file."""
+        if self._result_df is None:
+            messagebox.showwarning("Aucun résultat", "Exécutez d'abord une opération ou chargez un fichier principal (par ex. Fichier A) dont le résultat s'affiche en bas, puis relancez le découpage par lignes.")
+            self._set_running(False)
+            return
 
-            def _done():
-                cancelled = self._cancel_requested and error_msg is None
-                self._sp_prog_bar.set(1 if not cancelled else min(total_written / total_sheets, 0.99))
-                if error_msg:
-                    self._sp_prog_label.configure(text=f"Erreur : {error_msg}")
-                    messagebox.showerror("Erreur de scission", error_msg)
-                else:
-                    summary = (
-                        f"{total_written} fichier(s) créé(s) à partir de "
-                        f"{len(sp_files_copy)} source(s)."
-                    )
-                    if cancelled:
-                        summary = f"Scission annulée. {summary}"
-                    self._sp_prog_label.configure(text=f"✓ {summary}")
-                    self._stats_var.set(summary)
-                    self._log(f"[Scinder]  {summary}")
-                    if not cancelled:
-                        _show_done_dialog(self, "Scission terminée", summary, str(dest_dir))
-                self._set_running(False)
-            self.after(0, _done)
+        try:
+            lines_per_file = int(self._sl_lines_var.get().strip())
+            if lines_per_file <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Erreur", "Le nombre de lignes doit être un entier positif.")
+            self._set_running(False)
+            return
 
-        threading.Thread(target=_worker, daemon=True).start()
+        out_dir_str = self._sl_dir_var.get().strip()
+        zebra = self._sl_zebra_var.get()
+        df_snapshot = self._result_df.clone()
+
+        source_path = getattr(self._pa, "path", "resultat")
+        if not source_path:
+            source_path = "resultat"
+
+        self._sl_prog_frame.pack(fill="x", padx=4, pady=(2, 4))
+        
+        split_service.run_split_lines(
+            df=df_snapshot,
+            source_path=source_path,
+            out_dir_str=out_dir_str,
+            lines_per_file=lines_per_file,
+            zebra=zebra,
+            progress_bar=self._sl_prog_bar,
+            progress_label=self._sl_prog_label,
+            stats_var=self._stats_var,
+            log_func=self._log,
+            show_done_func=lambda t, m, p: show_done_dialog(self, t, m, p),
+            set_running_func=self._set_running,
+            cancel_check_func=lambda: self._cancel_requested,
+            after_func=self.after,
+            default_out_path=DEFAULT_OUT
+        )
 
     def _op_splitcol(self):
         """Split file(s) by column values — optimised, threaded, with progress bar."""
-        from copy import copy as _copy
-
-        # ── 1. Validate inputs (still on main thread) ──────────────────────
         if self._sc_df is None:
             messagebox.showwarning("Aucun fichier", "Chargez un fichier dans Scinder (Colonnes).")
             self._set_running(False)
@@ -2458,13 +2296,8 @@ class App(ctk.CTk):
             self._set_running(False)
             return
 
-        # Snapshot all state on main thread
         out_dir_str = self._sc_dir_var.get().strip()
         src_path = getattr(self, "_sc_source_path", "") or ""
-        base_dir = pathlib.Path(out_dir_str) if out_dir_str else DEFAULT_OUT
-        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out_dir = base_dir / ts
-
         zebra = self._sc_zebra_var.get()
         out_format = self._sc_format_var.get()
         pdf_dir = self._sc_pdf_dir_var.get()
@@ -2480,7 +2313,6 @@ class App(ctk.CTk):
         sheet_names = list(self._sc_xls.sheet_names) if all_sheets_mode else None
         df_snapshot = self._sc_df.clone()
 
-        # ── 2. Pre-compute total number of output files ─────────────────
         def _count_groups(df: pl.DataFrame) -> int:
             cols_present = [c for c in split_cols if c in df.columns]
             if not cols_present:
@@ -2504,208 +2336,32 @@ class App(ctk.CTk):
             self._set_running(False)
             return
 
-        # ── 3. Show progress bar ────────────────────────────────────────
         self._sc_prog_frame.pack(fill="x", padx=4, pady=(2, 4))
-        self._sc_prog_bar.set(0)
-        self._sc_prog_label.configure(
-            text=f"0 / {total_groups} fichier(s) — démarrage …")
-        self.update_idletasks()
-
-        # ── 4. Helpers (closures — no self needed in thread) ────────────
-        def _safe_fname(keys):
-            if not isinstance(keys, tuple):
-                keys = (keys,)
-            parts = []
-            for k in keys:
-                s = str(k).strip()
-                if s.endswith(".0"):
-                    try:
-                        if float(s).is_integer():
-                            s = s[:-2]
-                    except ValueError:
-                        pass
-                for ch in '/\\:*?"<>|':
-                    s = s.replace(ch, "_")
-                parts.append(s)
-            return ("_".join(parts) if any(parts) else "(vide)")[:200]
-
-        def _safe_sheetname(name: str) -> str:
-            for ch in '/\\:*?"<>|':
-                name = name.replace(ch, "_")
-            return name[:60]
-
-        # ── 5. Fast split: write each group directly with Polars ───────
-        def _process_fast(df_sheet, dest_dir, counter):
-            """Fast path: write groups using Polars write_excel (no formatting copy)."""
-            keep_present = [c for c in keep_cols if c in df_sheet.columns]
-            cols_present = [c for c in split_cols if c in df_sheet.columns]
-            if not keep_present or not cols_present:
-                return counter
-
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            groups = df_sheet.partition_by(cols_present, maintain_order=True, as_dict=True)
-
-            for keys, group_df in groups.items():
-                if self._cancel_requested:
-                    break
-                if isinstance(keys, str):
-                    keys = (keys,)
-                fname = _safe_fname(keys)
-                out_path = dest_dir / f"{fname}.xlsx"
-                group_df.select(keep_present).write_excel(str(out_path))
-                counter += 1
-                done = counter
-                self.after(0, lambda d=done: (
-                    self._sc_prog_bar.set(d / total_groups),
-                    self._sc_prog_label.configure(
-                        text=f"{d} / {total_groups} fichier(s) créé(s)")
-                ))
-            return counter
-
-        # ── 5b. Zebra split: write with Polars then apply zebra fills ──
-        def _process_zebra(df_sheet, dest_dir, counter):
-            """Zebra path: write data with Polars, then apply zebra styling with openpyxl."""
-            keep_present = [c for c in keep_cols if c in df_sheet.columns]
-            cols_present = [c for c in split_cols if c in df_sheet.columns]
-            if not keep_present or not cols_present:
-                return counter
-
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            groups = df_sheet.partition_by(cols_present, maintain_order=True, as_dict=True)
-
-            for keys, group_df in groups.items():
-                if self._cancel_requested:
-                    break
-                if isinstance(keys, str):
-                    keys = (keys,)
-                fname = _safe_fname(keys)
-                out_path = dest_dir / f"{fname}.xlsx"
-                sub = group_df.select(keep_present)
-                sub.write_excel(str(out_path))
-                _apply_zebra(str(out_path))
-                counter += 1
-                done = counter
-                self.after(0, lambda d=done: (
-                    self._sc_prog_bar.set(d / total_groups),
-                    self._sc_prog_label.configure(
-                        text=f"{d} / {total_groups} fichier(s) créé(s)")
-                ))
-            return counter
-
-        # ── 5c. PDF split: write with ReportLab ──
-        def _process_pdf(df_sheet, dest_dir, counter):
-            keep_present = [c for c in keep_cols if c in df_sheet.columns]
-            cols_present = [c for c in split_cols if c in df_sheet.columns]
-            if not keep_present or not cols_present:
-                return counter
-
-            dest_dir.mkdir(parents=True, exist_ok=True)
-            groups = df_sheet.partition_by(cols_present, maintain_order=True, as_dict=True)
-            
-            orig_printer = None
-            if auto_print and target_printer != "Par défaut":
-                orig_printer = get_default_printer()
-                if target_printer != orig_printer:
-                    set_default_printer(target_printer)
-
-            for keys, group_df in groups.items():
-                if self._cancel_requested:
-                    break
-                if isinstance(keys, str):
-                    keys = (keys,)
-                fname = _safe_fname(keys)
-                out_path = dest_dir / f"{fname}.pdf"
-                
-                title = " - ".join(str(k) for k in keys) if keys else "Rapport"
-                sub = group_df.select(keep_present)
-                
-                try:
-                    pdf_generator.generate_report(
-                        df=sub,
-                        output_path=str(out_path),
-                        title=title,
-                        subtitle="Extrait généré par Split (Colonnes)",
-                        orientation="Paysage",
-                        direction=pdf_dir
-                    )
-                    
-                    if auto_print:
-                        import os
-                        try:
-                            os.startfile(str(out_path), "print")
-                            import time
-                            time.sleep(1.5)  # give Windows spooler a moment to queue
-                        except Exception as e:
-                            logging.error(f"Échec de l'impression de {out_path}: {e}")
-                except Exception as e:
-                    logging.exception(f"Erreur PDF pour {fname}")
-                    
-                counter += 1
-                done = counter
-                self.after(0, lambda d=done: (
-                    self._sc_prog_bar.set(d / total_groups),
-                    self._sc_prog_label.configure(
-                        text=f"{d} / {total_groups} fichier(s) créé(s)")
-                ))
-                
-            if auto_print and orig_printer and target_printer != "Par défaut":
-                set_default_printer(orig_printer)
-                
-            return counter
-
-        # Select the appropriate processing function
-        if out_format == "PDF (.pdf)":
-            _process = _process_pdf
-        else:
-            _process = _process_zebra if zebra else _process_fast
-
-        # ── 6. Background worker ────────────────────────────────────────
-        def _worker():
-
-            total_written = 0
-            error_msg = None
-            try:
-                out_dir.mkdir(parents=True, exist_ok=True)
-
-                if all_sheets_mode:
-                    for sname in sheet_names:
-                        if self._cancel_requested:
-                            break
-                        try:
-                            df_s = operations.cleanup_floats(pl.read_excel(src_path, sheet_name=sname))
-                            
-                        except Exception:
-                            continue
-                        sdir = out_dir / _safe_sheetname(sname)
-                        total_written = _process(df_s, sdir, total_written)
-                        if self._cancel_requested:
-                            break
-                else:
-                    df_clean = df_snapshot
-                    total_written = _process(df_clean, out_dir, total_written)
-            except Exception as e:
-                error_msg = str(e)
-                logging.exception("Erreur _op_splitcol")
-
-            def _done():
-                cancelled = self._cancel_requested and error_msg is None
-                self._sc_prog_bar.set(1 if not cancelled else min(total_written / total_groups, 0.99))
-                if error_msg:
-                    self._sc_prog_label.configure(text=f"Erreur : {error_msg}")
-                    messagebox.showerror("Erreur de scission (colonnes)", error_msg)
-                else:
-                    summary = f"{total_written} fichier(s) créé(s) dans {out_dir}"
-                    if cancelled:
-                        summary = f"Scission annulée. {summary}"
-                    self._sc_prog_label.configure(text=f"✓ {summary}")
-                    self._stats_var.set(summary)
-                    self._log(f"[Scinder Colonnes]  {total_written} fichier(s) → {out_dir}")
-                    if not cancelled:
-                        _show_done_dialog(self, "Scission terminée", summary, str(out_dir))
-                self._set_running(False)
-            self.after(0, _done)
-
-        threading.Thread(target=_worker, daemon=True).start()
+        
+        split_service.run_split_columns(
+            df_snapshot=df_snapshot,
+            src_path=src_path,
+            out_dir_str=out_dir_str,
+            split_cols=split_cols,
+            keep_cols=keep_cols,
+            out_format=out_format,
+            zebra=zebra,
+            pdf_dir=pdf_dir,
+            auto_print=auto_print,
+            target_printer=target_printer,
+            all_sheets_mode=all_sheets_mode,
+            sheet_names=sheet_names,
+            total_groups=total_groups,
+            progress_bar=self._sc_prog_bar,
+            progress_label=self._sc_prog_label,
+            stats_var=self._stats_var,
+            log_func=self._log,
+            show_done_func=lambda t, m, p: show_done_dialog(self, t, m, p),
+            set_running_func=self._set_running,
+            cancel_check_func=lambda: self._cancel_requested,
+            after_func=self.after,
+            default_out_path=DEFAULT_OUT
+        )
 
 
     # =========================================================================
@@ -2822,8 +2478,8 @@ class App(ctk.CTk):
                 f"{pathlib.Path(path).name}"
             )
             if self._exp_zebra_var.get():
-                _apply_zebra(path)
-            _show_done_dialog(self, "Enregistré", f"Fichier sauvegardé :\n{path}", path)
+                apply_zebra(path)
+            show_done_dialog(self, "Enregistré", f"Fichier sauvegardé :\n{path}", path)
         except Exception as e:
             messagebox.showerror("Erreur d'enregistrement", str(e))
 
